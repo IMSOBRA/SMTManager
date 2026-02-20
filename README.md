@@ -24,5 +24,5 @@ v2.0에서 도입한 **WMI 이벤트 기반(Event-driven)** 즉시 감지를 유
 4. **종료**: 트레이 아이콘 우클릭 후 '완전 종료'를 선택합니다.
 
 ## 👤 제작자
-- **SOBRA** (rudxo0613)
+- **SOBRA** (IMSOBRA)
 - Vibe Coding Project
