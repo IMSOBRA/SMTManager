@@ -1,0 +1,7 @@
+[2026-02-20 16:34:51] 모니터링 시작 (WMI 이벤트 기반) | Vibe Coding BY SOBRA
+[2026-02-20 16:34:51] ═══ SMT Manager v2.0 시작 | Vibe Coding BY SOBRA ═══
+[2026-02-20 16:34:56] 🚀 시작 프로그램 등록 완료! (--tray 인자 추가됨)
+[2026-02-20 16:47:19] ⚡ 생성 감지(WMI): heroes_x64.exe (PID: 5500)
+[2026-02-20 16:47:19] ✅ SMT OFF 적용: heroes_x64.exe (PID: 5500)
+[2026-02-20 16:49:18] 🔄 종료 감지(WMI): heroes_x64.exe (PID: 5500)
+[2026-02-20 16:51:54] ═══ SMT Manager 완전 종료 지시 | Vibe Coding BY SOBRA ═══

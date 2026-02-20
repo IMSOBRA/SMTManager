@@ -1,10 +1,11 @@
 """
 ╔══════════════════════════════════════════╗
-║   SMT Manager v1.2                       ║
+║   SMT Manager v2.0                       ║
 ║   Vibe Coding BY SOBRA                   ║
 ╚══════════════════════════════════════════╝
 
 마비노기 / 마비노기 영웅전 자동 SMT 관리 프로그램
+WMI 이벤트 기반(Event-driven) 최적화 버전
 설정 창에서 세팅 후 백그라운드 실행 → 트레이에서 상주
 """
 
@@ -19,6 +20,8 @@ import logging
 
 import psutil
 import pystray
+import pythoncom
+import win32com.client
 from PIL import Image, ImageDraw
 
 import tkinter as tk
@@ -28,7 +31,7 @@ from tkinter import ttk, scrolledtext, messagebox
 # 상수
 # ═══════════════════════════════════════════
 APP_NAME = "SMT Manager"
-APP_VERSION = "1.2"
+APP_VERSION = "2.0"
 APP_AUTHOR = "Vibe Coding BY SOBRA"
 TASK_NAME = "SMTManager_SOBRA"
 
@@ -42,9 +45,8 @@ LOG_PATH = os.path.join(BASE_DIR, "smt_log.txt")
 
 DEFAULT_CONFIG = {
     "enabled": True,
-    "check_interval": 60,
     "game_processes": ["Client", "heroes", "heroes_x64"],
-    "custom_mask": ""  # 5. 커스텀 마스크 지원
+    "custom_mask": ""  # 커스텀 마스크 지원
 }
 
 # ═══════════════════════════════════════════
@@ -102,7 +104,11 @@ class ConfigManager:
         try:
             if os.path.exists(CONFIG_PATH):
                 with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                    self.config.update(json.load(f))
+                    loaded = json.load(f)
+                    # 이전 버전 config와 호환되게 업데이트, 불필요한 값은 무시될 수 있음
+                    for k, v in loaded.items():
+                        if k in self.config:
+                            self.config[k] = v
         except Exception:
             pass
 
@@ -124,7 +130,7 @@ class ConfigManager:
 
 
 # ═══════════════════════════════════════════
-# 게임 모니터
+# 게임 모니터 (WMI 이벤트 기반)
 # ═══════════════════════════════════════════
 class GameMonitor:
     def __init__(self, config):
@@ -132,9 +138,6 @@ class GameMonitor:
         self.processed_pids = {}
         self.running = False
         self.thread = None
-        
-        # 3. 모니터링 대기 방식 최적화 ( 즉각 종료 및 리프레시를 위해 threading.Event 적용 )
-        self.stop_event = threading.Event()
         
         self.smt_off_mask = calculate_smt_off_mask()
         self._update_mask()
@@ -160,44 +163,22 @@ class GameMonitor:
         if self.running:
             return
         self.running = True
-        self.stop_event.clear()
-        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread = threading.Thread(target=self._wmi_loop, daemon=True)
         self.thread.start()
-        logger.info("모니터링 시작 | Vibe Coding BY SOBRA")
+        logger.info("모니터링 시작 (WMI 이벤트 기반) | Vibe Coding BY SOBRA")
 
     def wake_up(self):
-        """즉각적으로 루프를 다시 돌도록 이벤트를 설정"""
-        self.stop_event.set()
+        """설정 변경 등 즉각 반영을 위해 초기화/재검사 수행"""
+        if self.config["enabled"]:
+            self._initial_scan()
+        else:
+            self._status = "비활성화됨"
+            self.restore_all()
 
     def stop(self):
         self.running = False
-        self.stop_event.set()
         if self.thread and self.thread.is_alive():
-            self.thread.join(timeout=2.0)
-
-    def _loop(self):
-        while self.running:
-            try:
-                self._update_mask()
-                if self.config["enabled"]:
-                    self._check()
-                    self._cleanup()
-                else:
-                    self._status = "비활성화됨"
-                    self.restore_all()  # 2. 비활성화 시 자동 복구
-            except Exception as e:
-                logger.error(f"모니터링 오류: {e}")
-                
-            self.stop_event.wait(self.config["check_interval"])
-            
-            # 루프 재시작을 위해 이벤트가 걸려있다면 다시 풀어줌 (종료 목적이 아닌 경우)
-            if self.stop_event.is_set():
-                if not self.running:
-                    break
-                self.stop_event.clear()
-
-        # 스레드 종료 시 마지막으로 싹 복구
-        self.restore_all()
+            self.thread.join(timeout=2.5)
 
     def restore_all(self):
         """저장된 모든 PID를 다시 전체 코어 사용으로 복구"""
@@ -206,7 +187,6 @@ class GameMonitor:
             
         total_cpus = list(range(psutil.cpu_count(logical=True)))
         
-        # 딕셔너리가 루프 도중 변경될 수 있으므로 list(items()) 처리
         for pid, name in list(self.processed_pids.items()):
             if psutil.pid_exists(pid):
                 try:
@@ -216,8 +196,26 @@ class GameMonitor:
                 except (psutil.AccessDenied, psutil.NoSuchProcess) as e:
                     logger.warning(f"❌ 복구 실패: {name} (PID: {pid}) - {e}")
         self.processed_pids.clear()
+        self._active_games = 0
+        if self.config["enabled"]:
+            self._status = "게임 대기 중..."
 
-    def _check(self):
+    def _apply_smt_off(self, pid, pname):
+        if pid not in self.processed_pids:
+            try:
+                p = psutil.Process(pid)
+                cpus = [i for i in range(psutil.cpu_count(logical=True))
+                        if self.smt_off_mask & (1 << i)]
+                p.cpu_affinity(cpus)
+                self.processed_pids[pid] = pname
+                self._active_games = len(self.processed_pids)
+                self._status = f"게임 {self._active_games}개 감지됨 (SMT OFF)"
+                logger.info(f"✅ SMT OFF 적용: {pname} (PID: {pid})")
+            except (psutil.AccessDenied, psutil.NoSuchProcess) as e:
+                logger.warning(f"❌ 적용 실패: {pname} (PID: {pid}) - {e}")
+
+    def _initial_scan(self):
+        self._update_mask()
         names = [n.lower() for n in self.config["game_processes"]]
         found = 0
         for proc in psutil.process_iter(["pid", "name"]):
@@ -226,28 +224,73 @@ class GameMonitor:
                 if pname is None:
                     continue
                 if os.path.splitext(pname)[0].lower() in names:
-                    pid = proc.info["pid"]
+                    self._apply_smt_off(proc.info["pid"], pname)
                     found += 1
-                    if pid not in self.processed_pids:
-                        try:
-                            p = psutil.Process(pid)
-                            cpus = [i for i in range(psutil.cpu_count(logical=True))
-                                    if self.smt_off_mask & (1 << i)]
-                            p.cpu_affinity(cpus)
-                            self.processed_pids[pid] = pname
-                            logger.info(f"✅ SMT OFF 적용: {pname} (PID: {pid})")
-                        except (psutil.AccessDenied, psutil.NoSuchProcess) as e:
-                            logger.warning(f"❌ 적용 실패: {pname} (PID: {pid}) - {e}")
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
-        self._active_games = found
-        self._status = f"게임 {found}개 감지됨 (SMT OFF)" if found > 0 else "게임 대기 중..."
+        if found == 0 and len(self.processed_pids) == 0:
+            self._status = "게임 대기 중..."
 
-    def _cleanup(self):
-        dead = [pid for pid in self.processed_pids if not psutil.pid_exists(pid)]
-        for pid in dead:
-            name = self.processed_pids.pop(pid)
-            logger.info(f"🔄 종료 감지(프로세스 꺼짐): {name} (PID: {pid})")
+    def _wmi_loop(self):
+        # COM 객체 초기화
+        pythoncom.CoInitialize()
+        try:
+            wmi = win32com.client.Dispatch("WbemScripting.SWbemLocator")
+            services = wmi.ConnectServer(".", "root\\cimv2")
+            
+            # 프로세스 시작 및 종료 이벤트를 이벤트 기반으로 가져옵니다 (0% 폴링 오버헤드).
+            query = "SELECT * FROM Win32_ProcessTrace"
+            events = services.ExecNotificationQuery(query)
+
+            if self.config["enabled"]:
+                self._initial_scan()
+            else:
+                self._status = "비활성화됨"
+
+            while self.running:
+                try:
+                    # 블로킹 없는 검사를 위해 2초(2000ms) 대기 후 반복
+                    event = events.NextEvent(2000)
+                except pythoncom.com_error:
+                    # Timeout 발생
+                    continue
+                except Exception as e:
+                    logger.error(f"WMI 이벤트 처리 오류: {e}")
+                    time.sleep(2)
+                    continue
+
+                if not self.running:
+                    break
+                if not self.config["enabled"]:
+                    continue
+
+                try:
+                    ev_type = event.Path_.Class
+                    pid = int(event.ProcessID)
+                    pname = event.ProcessName
+
+                    names = [n.lower() for n in self.config["game_processes"]]
+                    name_base = os.path.splitext(pname)[0].lower()
+
+                    if name_base in names:
+                        if ev_type == "Win32_ProcessStartTrace":
+                            logger.info(f"⚡ 생성 감지(WMI): {pname} (PID: {pid})")
+                            self._apply_smt_off(pid, pname)
+                        elif ev_type == "Win32_ProcessStopTrace":
+                            if pid in self.processed_pids:
+                                del_name = self.processed_pids.pop(pid)
+                                logger.info(f"🔄 종료 감지(WMI): {del_name} (PID: {pid})")
+                                self._active_games = len(self.processed_pids)
+                                if self._active_games > 0:
+                                    self._status = f"게임 {self._active_games}개 감지됨 (SMT OFF)"
+                                else:
+                                    self._status = "게임 대기 중..."
+                except Exception as e:
+                    pass
+
+        finally:
+            self.restore_all()
+            pythoncom.CoUninitialize()
 
 
 # ═══════════════════════════════════════════
@@ -256,21 +299,9 @@ class GameMonitor:
 class StartupManager:
     @staticmethod
     def register():
-        # 1. 시작 프로그램 실행 시 --tray 명령어를 포함하여 조용히 켜지도록 수정
         if getattr(sys, 'frozen', False):
-            # PyInstaller로 빌드된 경우: "경로\SMTManager.exe" --tray
-            action = f'"{sys.executable}" --tray'
-        else:
-            # 파이썬 스크립트인 경우: "경로\pythonw.exe" "경로\SMTManager.py" --tray
-            action = f'"{sys.executable}" "{os.path.abspath(__file__)}" --tray'
-
-        # 따옴표 충돌을 피하기 위해 /TR 에 백슬래시와 따옴표를 사용하여 전달 (schtasks 규칙)
-        if getattr(sys, 'frozen', False):
-            # PyInstaller로 빌드된 경우: "경로\SMTManager.exe" --tray
             tr_cmd = f'\\"{sys.executable}\\" --tray'
         else:
-            # 파이썬 스크립트인 경우: "경로\pythonw.exe" "경로\SMTManager.py" --tray
-            # python.exe 대신 pythonw.exe를 사용하여 콘솔 창 없이 백그라운드 실행 보장
             python_exe = sys.executable
             if python_exe.lower().endswith("python.exe"):
                 python_exe = python_exe[:-10] + "pythonw.exe"
@@ -342,15 +373,14 @@ class SMTManagerApp:
         self.tray_icon = None
         self.tray_running = False
 
-        # tkinter 메인 윈도우
         self.root = tk.Tk()
         self.root.title(f"{APP_NAME} - {APP_AUTHOR}")
-        self.root.geometry("520x760")
+        # 세로 길이를 체크 간격이 빠졌으므로 살짝 줄입니다
+        self.root.geometry("520x680")
         self.root.resizable(False, False)
         self.root.configure(bg="#1a1a2e")
         self.root.protocol("WM_DELETE_WINDOW", self._minimize_to_tray)
 
-        # 윈도우 아이콘
         try:
             import io, base64
             buf = io.BytesIO()
@@ -361,23 +391,17 @@ class SMTManagerApp:
             pass
 
         self._build_ui()
-        
-        # 모니터링은 바로 시작 (설정 보면서도 백그라운드에서 동작)
         self.monitor.start()
-        
-        # 4. 앱 실행 시 무조건 트레이 아이콘을 띄워두기 (항상 표시)
         self._start_tray()
 
-        # 1. 백그라운드 매개변수 체크 (--tray)
         if "--tray" in sys.argv:
             logger.info("시작 프로그램(또는 --tray 인자)에 의해 백그라운드로 조용히 실행됨.")
-            self.root.withdraw() # 창을 곧바로 숨김!
+            self.root.withdraw()
 
     def run(self):
         logger.info(f"═══ {APP_NAME} v{APP_VERSION} 시작 | {APP_AUTHOR} ═══")
         self.root.mainloop()
 
-    # ─── UI 빌드 ───
     def _build_ui(self):
         w = self.root
         style = ttk.Style(w)
@@ -409,7 +433,7 @@ class SMTManagerApp:
         self.status_label.pack(anchor="w")
         self._update_status()
 
-        # ─── 🚀 백그라운드 실행 버튼 (눈에 띄게) ───
+        # ─── 🚀 백그라운드 실행 버튼 ───
         bg_btn_frame = tk.Frame(w, bg=bg)
         bg_btn_frame.pack(fill="x", padx=20, pady=(0, 10))
 
@@ -447,7 +471,6 @@ class SMTManagerApp:
         self.mask_info_label = ttk.Label(card1, text=f"ℹ️ {cpu_info} | SMT OFF 적용 마스크: {hex(self.monitor.smt_off_mask)}", style="Card.TLabel")
         self.mask_info_label.pack(anchor="w", pady=(8, 0))
         
-        # 5. 커스텀 마스크 컨트롤
         mf = tk.Frame(card1, bg=card_bg)
         mf.pack(fill="x", pady=(5, 0))
         ttk.Label(mf, text="커스텀 마스크(Hex):", style="Card.TLabel").pack(side="left")
@@ -461,25 +484,15 @@ class SMTManagerApp:
                   command=self._apply_mask).pack(side="left", padx=2)
         ttk.Label(mf, text="(비워두면 자동 계산)", style="Card.TLabel", foreground="#8888aa").pack(side="left", padx=5)
 
-
-        # ─── 체크 간격 ───
-        card2 = tk.LabelFrame(w, text="  체크 간격  ", bg=card_bg, fg=accent,
+        # ─── 감지 방식 알림 (WMI 이벤트 기반) ───
+        card2 = tk.LabelFrame(w, text="  감지 시스템  ", bg=card_bg, fg=accent,
                               font=("Segoe UI", 11, "bold"), bd=1, relief="groove", padx=15, pady=10)
         card2.pack(fill="x", padx=20, pady=5)
 
-        it = tk.Frame(card2, bg=card_bg)
-        it.pack(fill="x")
-        ttk.Label(it, text="게임 프로세스 확인 주기:", style="Card.TLabel").pack(side="left")
-        self.interval_label = ttk.Label(it, text=f"{self.config['check_interval']}초", style="CardTitle.TLabel")
-        self.interval_label.pack(side="right")
-
-        self.interval_var = tk.IntVar(value=self.config["check_interval"])
-        tk.Scale(card2, from_=10, to=300, orient="horizontal", variable=self.interval_var,
-                 bg=card_bg, fg=fg, troughcolor="#0a0a1a", highlightthickness=0,
-                 sliderrelief="flat", activebackground=accent, font=("Segoe UI", 9),
-                 showvalue=False, command=self._on_interval).pack(fill="x", pady=(5, 0))
-        ttk.Label(card2, text="💡 작은 값 = 빠른 감지, 큰 값 = 낮은 CPU 사용",
-                  style="Card.TLabel").pack(anchor="w", pady=(5, 0))
+        tk.Label(card2, text="⚡ WMI 이벤트 트리거 즉시 감지 활성화 (0% 점유율)",
+                 bg=card_bg, fg="#00ff88", font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        tk.Label(card2, text="프로세스 켜짐/꺼짐을 OS 이벤트 수준에서 딜레이 없이 감지합니다.",
+                 bg=card_bg, fg="#8888aa", font=("Segoe UI", 9)).pack(anchor="w", pady=(2, 0))
 
         # ─── 게임 프로세스 ───
         card3 = tk.LabelFrame(w, text="  게임 프로세스 목록  ", bg=card_bg, fg=accent,
@@ -532,11 +545,10 @@ class SMTManagerApp:
                   font=("Segoe UI", 10, "bold"), bd=0, padx=15, pady=6,
                   command=self._save).pack(side="right")
 
-    # ─── 이벤트 핸들러 ───
     def _update_status(self):
         if self.root.winfo_exists():
             self.status_label.config(text=f"📡 {self.monitor.status}")
-            self.root.after(3000, self._update_status)
+            self.root.after(1000, self._update_status)
 
     def _toggle_smt(self):
         v = not self.smt_var.get()
@@ -547,8 +559,6 @@ class SMTManagerApp:
         if self.tray_icon:
             self.tray_icon.icon = create_icon(v)
         logger.info(f"SMT 자동 적용: {'활성화' if v else '비활성화'}")
-        
-        # 즉시 모니터 스레드를 깨워서 상태를 갱신(비활성화 시 복구)하도록 함
         self.monitor.wake_up()
 
     def _apply_mask(self):
@@ -560,11 +570,7 @@ class SMTManagerApp:
         cpu_info = f"CPU: {psutil.cpu_count(logical=False)}코어 / {psutil.cpu_count(logical=True)}스레드"
         self.mask_info_label.config(text=f"ℹ️ {cpu_info} | SMT OFF 적용 마스크: {hex(self.monitor.smt_off_mask)}")
         messagebox.showinfo(APP_NAME, f"마스크가 적용되었습니다!\n적용 값: {hex(self.monitor.smt_off_mask)}")
-        # 새 마스크 적용을 위해 스레드 깨우기
         self.monitor.wake_up()
-
-    def _on_interval(self, val):
-        self.interval_label.config(text=f"{int(float(val))}초")
 
     def _clear_ph(self):
         if self.add_entry.get() == "프로세스 이름 입력...":
@@ -619,29 +625,19 @@ class SMTManagerApp:
         t.see("end")
 
     def _save(self):
-        self.config["check_interval"] = self.interval_var.get()
         self.config["custom_mask"] = self.mask_entry.get().strip()
         self.config.save()
-        logger.info(f"설정 저장 | 간격: {self.config['check_interval']}초 | 설정 목록 갱신됨")
+        logger.info("설정 저장 완료")
         messagebox.showinfo(APP_NAME, "설정이 저장되었습니다! ✅")
-        # 간격 변경 등이 바로 반영되도록 스레드 깨우기
         self.monitor.wake_up()
 
-    # ─── 트레이 <-> 윈도우 전환 ───
     def _minimize_to_tray(self):
-        """창을 숨기고 트레이로 유지(이미 트레이는 켜져 있음)"""
-        # 먼저 설정 자동 저장
-        self.config["check_interval"] = self.interval_var.get()
         self.config["custom_mask"] = self.mask_entry.get().strip()
         self.config.save()
-
-        self.root.withdraw()  # 창 숨기기
+        self.root.withdraw()
 
     def _start_tray(self):
-        """시스템 트레이 아이콘 시작 (백그라운드 스레드) - 앱 시작 시 한 번만 실행됨"""
-        if self.tray_running:
-            return
-            
+        if self.tray_running: return
         menu = pystray.Menu(
             pystray.MenuItem(f"⚡ {APP_NAME} v{APP_VERSION}", None, enabled=False),
             pystray.MenuItem(f"   {APP_AUTHOR}", None, enabled=False),
@@ -651,7 +647,6 @@ class SMTManagerApp:
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("❌ 완전 종료", self._quit_app),
         )
-
         self.tray_icon = pystray.Icon(
             APP_NAME,
             create_icon(self.config["enabled"]),
@@ -659,39 +654,24 @@ class SMTManagerApp:
             menu
         )
         self.tray_running = True
-
-        # 별도 스레드에서 트레이 실행
         threading.Thread(target=self.tray_icon.run, daemon=True).start()
 
     def _show_from_tray(self, icon=None, item=None):
-        """트레이에서 설정 창 다시 표시"""
         self.root.after(0, self._restore_window)
 
     def _restore_window(self):
-        """메인 스레드에서 창 복원"""
         self.root.deiconify()
         self.root.lift()
         self.root.focus_force()
 
     def _quit_app(self, icon=None, item=None):
-        """완전 종료"""
         logger.info(f"═══ {APP_NAME} 완전 종료 지시 | {APP_AUTHOR} ═══")
-        
-        # 모니터 스레드를 끄고 복구(restore)를 기다림
         self.monitor.stop()
-        
         if self.tray_icon:
             self.tray_icon.stop()
-            
         self.root.after(0, self.root.destroy)
 
-
-# ═══════════════════════════════════════════
-# 엔트리포인트
-# ═══════════════════════════════════════════
 def main():
-    # 파이썬 스크립트로 직접 실행 시 (콘솔 창에서 띄웠을 때)
-    # 콘솔 창을 끄면 앱이 같이 죽는 현상을 방지하기 위해 pythonw.exe로 재실행
     if not getattr(sys, 'frozen', False):
         python_exe = sys.executable
         if python_exe.lower().endswith("python.exe") and "--nowindow" not in sys.argv:
@@ -701,10 +681,8 @@ def main():
                 subprocess.Popen(args, creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP)
                 sys.exit()
 
-    # 중복 실행 방지
     mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "SMTManager_SOBRA_Mutex")
     if ctypes.windll.kernel32.GetLastError() == 183:
-        # 단, "배치/자동 시작(--tray)"으로 켜졌다면 오류창 없이 조용히 종료 처리
         if "--tray" not in sys.argv:
             ctypes.windll.user32.MessageBoxW(
                 0, f"{APP_NAME}이(가) 이미 백그라운드에서 실행 중입니다!\n우측 하단 트레이 아이콘(^)을 확인하세요.",
@@ -712,14 +690,12 @@ def main():
             )
         sys.exit()
 
-    # 관리자 권한 확인
     if not is_admin():
         run_as_admin()
         return
 
     app = SMTManagerApp()
     app.run()
-
 
 if __name__ == "__main__":
     main()
