@@ -1,9 +1,0 @@
-{
-  "enabled": true,
-  "game_processes": [
-    "Client",
-    "heroes",
-    "heroes_x64"
-  ],
-  "custom_mask": ""
-}
