@@ -1,0 +1,10 @@
+﻿{
+  "enabled": true,
+  "check_interval": 30,
+  "game_processes": [
+    "client",
+    "heroes",
+    "heroes_x64"
+  ],
+  "custom_mask": ""
+}
