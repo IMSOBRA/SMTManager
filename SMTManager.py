@@ -1,5 +1,5 @@
 """
-SMT Manager 1.0.0
+SMT Manager 1.0.1
 
 특정 게임이 실행되면 해당 프로세스의 CPU affinity를 조정해
 SMT가 꺼진 것과 비슷한 효과를 내도록 돕는 Windows 전용 도구입니다.
@@ -37,7 +37,7 @@ except ImportError:
 
 
 APP_NAME = "SMT Manager"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 APP_AUTHOR = "IMSOBRA"
 TASK_NAME = "SMTManager"
 MUTEX_NAME = "SMTManager_Mutex"
@@ -764,7 +764,6 @@ class SMTManagerApp:
             font=("Segoe UI", 10),
         )
         self.status_label.pack(anchor="w")
-        self._update_status()
 
         tray_frame = tk.Frame(window, bg=bg)
         tray_frame.pack(fill="x", padx=20, pady=(0, 10))
@@ -830,6 +829,7 @@ class SMTManagerApp:
             style="Card.TLabel",
         )
         self.mask_info_label.pack(anchor="w", pady=(8, 0))
+        self._update_status()
 
         mask_frame = tk.Frame(smt_card, bg=card_bg)
         mask_frame.pack(fill="x", pady=(5, 0))
@@ -1028,7 +1028,8 @@ class SMTManagerApp:
     def _update_status(self) -> None:
         if self.root.winfo_exists():
             self.status_label.config(text=f"상태: {self.monitor.status}")
-            self.mask_info_label.config(text=self._mask_info_text())
+            if hasattr(self, "mask_info_label"):
+                self.mask_info_label.config(text=self._mask_info_text())
             self.root.after(1000, self._update_status)
 
     def _toggle_smt(self) -> None:
