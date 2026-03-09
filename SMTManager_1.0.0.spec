@@ -2,11 +2,11 @@
 
 
 a = Analysis(
-    ['SMTManager_v2_1.py'],
+    ["SMTManager.py"],
     pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=['pythoncom', 'win32com', 'win32com.client'],
+    hiddenimports=["pythoncom", "win32com", "win32com.client"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -22,7 +22,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='SMTManager_v2.1',
+    name="SMTManager_1.0.0",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
